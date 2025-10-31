@@ -46,6 +46,20 @@ struct Sevctl {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum SevctlCmd {
+    /// Add the cek certificate to a partial certificate chain returned by the PSP
+    Addcek {
+        /// Read SEV partial chain from specified file
+        #[arg(short, long, value_name = "crt", required = true)]
+        crt: PathBuf,
+
+        /// Id of the processor to get the CEK
+        #[arg(short, long, value_name = "id", required = true)]
+        id: String,
+
+        /// Output file
+        #[arg(long, value_name = "dst")]
+        dst: Option<PathBuf>,
+    },
     /// Export the SEV or entire certificate chain
     Export {
         /// Export the entire certificate chain? (SEV + CA chain)
@@ -251,6 +265,7 @@ fn main() -> Result<()> {
 
     let sevctl = Sevctl::parse();
     let status = match sevctl.cmd {
+        SevctlCmd::Addcek { crt, id, dst } => addcek::cmd(crt, id, dst ),
         SevctlCmd::Export { full, destination } => export::cmd(full, destination),
         SevctlCmd::Generate { cert, key } => generate::cmd(cert, key),
         SevctlCmd::Ok { gen } => ok::cmd(gen, sevctl.quiet),
@@ -551,5 +566,48 @@ mod provision {
             .context("failed to import the newly-signed PEK")?;
 
         Ok(())
+    }
+}
+
+
+
+mod addcek {
+
+    use std::{convert::TryFrom};
+
+    use super::*;
+
+    const CEK_SVC: &str = "https://kdsintf.amd.com/cek/id";
+
+    pub fn cmd(crt: PathBuf, id: String, dst: Option<PathBuf>) -> Result<()> {
+        let mut chain = sev_chain(crt)?;
+        let mut out = Cursor::new(Vec::new());
+
+        let url = format!("{}/{}", CEK_SVC, id);
+        let dst_path : PathBuf = match dst {
+            None => PathBuf::try_from("phd.bin")?,
+            Some(f) => f
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        chain.cek = rt.block_on(download(&url, Usage::CEK))?;
+
+        chain
+            .encode(&mut out, ())
+            .context("certificate chain encoding failed")?;
+
+        let mut file = File::create(dst_path).context("unable to create output file")?;
+
+        file.write_all(&out.into_inner())
+            .context("unable to write output file")?;
+
+        Ok(())
+    }
+
+    fn sev_chain(filename: PathBuf) -> Result<Chain> {
+        let mut file =
+            File::open(filename).context("unable to open SEV certificate chain file")?;
+
+        Chain::decode(&mut file, ()).context("unable to decode chain")
     }
 }
