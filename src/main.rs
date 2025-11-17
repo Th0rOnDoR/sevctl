@@ -98,6 +98,13 @@ enum SevctlCmd {
         /// Path to the owner's OCA private key.
         #[arg(value_name = "key", required = true)]
         key: PathBuf,
+        /// Path to the PEK input file.
+        #[arg(short, long, value_name = "in_pek", required = false)]
+        in_pek: Option<PathBuf>,
+        
+        /// Path to PEK output file.
+        #[arg(short, long, value_name = "out_pek", required = false)]
+        out_pek: Option<PathBuf>,
     },
 
     /// Reset the SEV platform state
@@ -272,7 +279,7 @@ fn main() -> Result<()> {
         SevctlCmd::Measurement(option) => match option {
             measurement::MeasurementCmd::Build(args) => measurement::build_cmd(args),
         },
-        SevctlCmd::Provision { cert, key } => provision::cmd(cert, key),
+        SevctlCmd::Provision { cert, key, in_pek, out_pek } => provision::cmd(cert, key, in_pek, out_pek),
         SevctlCmd::Reset => reset::cmd(),
         SevctlCmd::Rotate => rotate::cmd(),
         SevctlCmd::Secret(option) => match option {
@@ -541,8 +548,9 @@ mod provision {
 
     use ::sev::certs::sev::{PrivateKey, Signer};
 
-    pub fn cmd(oca_path: PathBuf, prv_key_path: PathBuf) -> Result<()> {
-        let mut fw = firmware()?;
+    pub fn cmd(oca_path: PathBuf, prv_key_path: PathBuf, in_pek: Option<PathBuf>, out_pek: Option<PathBuf>) -> Result<()> {
+        let mut out = Cursor::new(Vec::new());
+       
         let cert = File::open(oca_path.clone())
             .context(format!("failed to open {}", oca_path.display()))
             .and_then(|mut f| Certificate::decode(&mut f, ()).context("failed to decode OCA"))?;
@@ -554,17 +562,38 @@ mod provision {
                     .context("failed to decode OCA private key")
             })?;
 
-        let mut pek = fw
-            .pek_csr()
-            .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))
-            .context("cross signing request failed")?;
+        let mut pek = match in_pek {
+            None => {
+                let mut fw = firmware()?;
+                fw.pek_csr()
+                .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))
+                .context("cross signing request failed")?
+            }
+            Some(f) => { let mut file =
+                File::open(f.clone()).context(format!("failed to open {}", f.display()))?;
+                Certificate::decode(&mut file, ()).context("Unable to decode certificate")?
+            }
+        };
+
         prv_key
             .sign(&mut pek)
             .context("failed to sign PEK with OCA private key")?;
-        fw.pek_cert_import(&pek, &cert)
-            .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))
-            .context("failed to import the newly-signed PEK")?;
-
+        
+        match out_pek {
+            None => {
+                let mut fw = firmware()?;
+                fw.pek_cert_import(&pek, &cert)
+                    .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))
+                    .context("failed to import the newly-signed PEK")?;
+            }
+            Some(f) => {
+                let mut file = File::create(f.clone()).context(format!("failed to open {}", f.display()))?;
+                pek.encode(&mut out, ()).context("Failed to write pek to output file")?;
+                file.write_all(&out.into_inner())
+                    .context("unable to write output file")?;
+            }
+        };
+         
         Ok(())
     }
 }
