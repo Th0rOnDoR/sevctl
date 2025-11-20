@@ -70,6 +70,13 @@ enum SevctlCmd {
         #[arg(value_name = "destination", required = true)]
         destination: PathBuf,
     },
+    
+    /// Get latest firmware
+    Firmware {
+        /// firmware output file path
+        #[arg(value_name = "out", required = true)]
+        out: PathBuf,
+    },
 
     /// Generate a new self-signed OCA certificate and key
     Generate {
@@ -173,7 +180,8 @@ enum SevctlCmd {
     Secret(secret::SecretCmd),
 }
 
-async fn download(url: &str, usage: Usage) -> Result<Certificate> {
+async fn download(url: &str) -> Result<Cursor<Vec<u8>>> {
+    
     let mut err_stack: Vec<anyhow::Error> = vec![];
 
     for attempt in 1..4 {
@@ -192,9 +200,7 @@ async fn download(url: &str, usage: Usage) -> Result<Certificate> {
             }
             Ok(rsp) => match rsp.bytes().await {
                 Ok(body) => {
-                    let out = Cursor::new(body.into_iter().collect::<Vec<u8>>());
-                    return Certificate::decode(out, ())
-                        .context(format!("failed to decode {} certificate", usage));
+                    return Ok(Cursor::new(body.into_iter().collect::<Vec<u8>>()));
                 }
                 Err(e) => return Err(anyhow::Error::new(e).context("failed to read response body")),
             },
@@ -217,14 +223,23 @@ async fn download(url: &str, usage: Usage) -> Result<Certificate> {
         anyhow::anyhow!(prev_attempts.join("; "))
             .context(format!("final http request failed: {}", e))
     })?;
+    
+    if !(rsp).status().is_success() {
+        return Err(anyhow::anyhow!(format!("Http request {}", rsp.status().as_u16())));
+    }
 
     match rsp.bytes().await {
         Ok(body) => {
-            let out = Cursor::new(body.into_iter().collect::<Vec<u8>>());
-            Certificate::decode(out, ()).context(format!("failed to decode {} certificate", usage))
-        }
+            return Ok(Cursor::new(body.into_iter().collect::<Vec<u8>>()));
+        },
         Err(e) => Err(anyhow::Error::new(e).context("failed to read response body")),
     }
+}
+    
+fn download_certificate(url: &str, usage: Usage) -> Result<Certificate> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let out = rt.block_on(download(url))?;
+    return Certificate::decode(out, ()).context(format!("failed to decode {} certificate", usage))
 }
 
 fn firmware() -> Result<Firmware> {
@@ -252,8 +267,7 @@ fn chain() -> Result<Chain> {
         .context("error fetching identifier")?;
     let url = format!("{}/{}", CEK_SVC, id);
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    chain.cek = rt.block_on(download(&url, Usage::CEK))?;
+    chain.cek = download_certificate(&url, Usage::CEK)?;
 
     Ok(chain)
 }
@@ -274,6 +288,7 @@ fn main() -> Result<()> {
     let status = match sevctl.cmd {
         SevctlCmd::Addcek { crt, id, dst } => addcek::cmd(crt, id, dst ),
         SevctlCmd::Export { full, destination } => export::cmd(full, destination),
+        SevctlCmd::Firmware { out } => firmware::cmd(out),
         SevctlCmd::Generate { cert, key } => generate::cmd(cert, key),
         SevctlCmd::Ok { gen } => ok::cmd(gen, sevctl.quiet),
         SevctlCmd::Measurement(option) => match option {
@@ -614,19 +629,17 @@ mod addcek {
 
         let url = format!("{}/{}", CEK_SVC, id);
         let dst_path : PathBuf = match dst {
-            None => PathBuf::try_from("phd.bin")?,
+            None => PathBuf::try_from("pdh.bin")?,
             Some(f) => f
         };
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        chain.cek = rt.block_on(download(&url, Usage::CEK))?;
+        chain.cek = download_certificate(&url, Usage::CEK)?;
 
         chain
             .encode(&mut out, ())
             .context("certificate chain encoding failed")?;
 
         let mut file = File::create(dst_path).context("unable to create output file")?;
-
         file.write_all(&out.into_inner())
             .context("unable to write output file")?;
 
@@ -638,5 +651,62 @@ mod addcek {
             File::open(filename).context("unable to open SEV certificate chain file")?;
 
         Chain::decode(&mut file, ()).context("unable to decode chain")
+    }
+}
+
+//https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/amd/amd_sev_fam17h_model0xh.sbin
+
+
+mod firmware {
+    use super::*;
+    
+    use proc_cpuinfo::{CpuInfo};
+
+    const REPO: &str = "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/amd";
+
+    pub fn cmd(dst: PathBuf) -> Result<()> {
+        let cpu = CpuInfo::read()?;
+        let cpu_info = cpu.cpu(0).unwrap();
+        let url_specific = format!("{}/amd_sev_fam{:x}h_model{:x}h.sbin", REPO, 
+                    cpu_info.cpu_family().unwrap(),
+                    cpu_info.model().unwrap());
+        let url_family = format!("{}/amd_sev_fam{:x}h_model{:x}xh.sbin", REPO, 
+                    cpu_info.cpu_family().unwrap(),
+                    cpu_info.model().unwrap() / 16);
+        let url_generic = format!("{}/sev.fw", REPO);
+        //need to do it in reverse by ignoring stuff, firmware can be inexistant
+        
+        let mut file = File::create(dst).context("unable to create output file")?;
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        
+        match rt.block_on(download(&url_specific)) {
+            Ok(out) => {
+                println!("Find specific firmware version");
+                file.write_all(&out.into_inner()).context("unable to write output file")?; return Ok(());
+            },
+            Err(_err) => {
+                println!("No specific firmware version");
+            }
+        }
+        match rt.block_on(download(&url_family)) {
+            Ok(out) => {
+                println!("Find family firmware version");
+                file.write_all(&out.into_inner()).context("unable to write output file")?; return Ok(());
+            },
+            Err(_err) => {
+                println!("No less firmware version, this should never happens");
+            }
+        }
+        match rt.block_on(download(&url_generic)) {
+            Ok(out) => {
+                println!("Find generic firmware version");
+                file.write_all(&out.into_inner()).context("unable to write output file")?; return Ok(());
+            },
+            Err(_err) => {
+                println!("No generic firmware, this should happens, amd doesn't provide generic version");
+            }
+        }
+        Ok(())
     }
 }
